@@ -8,7 +8,7 @@ Email and notification templates, provider adapters, and schedulers for user-fac
 - Digest/scheduler jobs for research updates and plan changes.
 - Webhook handlers for provider events (bounces, spam, delivered).
 
-## Repo layout (proposed)
+## Repo layout
 - `templates/` — email/layout assets and JSON metadata per provider.
 - `src/providers/` — provider adapters and webhooks.
 - `src/workflows/` — message composition, routing, and fallbacks.
@@ -35,6 +35,18 @@ Email and notification templates, provider adapters, and schedulers for user-fac
 - Define the send contract (payload + tracing) shared with `intellex-api`.
 - Add provider choice/config docs and a sync script to keep templates consistent.
 
-## Current scaffold
-- Send contract: `src/contracts/send.ts` (request/response/provider event payloads).
-- Template sync stub: `scripts/sync-templates.sh` (wire to provider SDK/CLI).
+## Runtime
+- Express + TypeScript service (entry `src/index.ts`) exposing:
+  - `POST /send` — accepts `SendRequest` from `src/contracts/send.ts` and sends via Resend.
+  - `POST /webhooks/provider` — placeholder for provider events (verifies `EMAIL_WEBHOOK_SECRET`).
+  - `GET /health` — liveness check.
+- Templates are loaded from `templates/` and rendered by simple `{{ .Key }}` replacement.
+
+## Local dev
+1) `npm install`
+2) Copy `.env.example` to `.env` and fill required vars.
+3) `npm run dev` (defaults to port `8700`).
+
+## Notes
+- `EMAIL_PROVIDER_KEY` must be a Resend API key and `EMAIL_FROM` must be a verified sender/domain.
+- Webhook routing back to `intellex-api` is a follow‑up once delivery tracking is needed.
