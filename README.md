@@ -17,6 +17,14 @@ Email and notification templates, provider adapters, and schedulers for user-fac
 - `scripts/` — template sync/publish tools.
 - `tests/` — render/delivery tests.
 
+## Environment
+- Copy `.env.example` to `.env` and set:
+  - `EMAIL_PROVIDER_KEY`, `EMAIL_FROM`, `EMAIL_WEBHOOK_SECRET`
+  - `API_BASE_URL` (for routing replies/errors to the API)
+  - `COMMUNICATIONS_BASE_URL` (self base URL for webhooks)
+  - `REDIS_URL` if using async queueing
+  - `LOG_LEVEL`
+
 ## Workflow
 1) Author/update templates; run render checks locally.
 2) Sync templates to providers; publish a versioned bundle for `intellex-api`/`intellex-orchestrator` to call.
