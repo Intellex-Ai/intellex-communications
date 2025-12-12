@@ -11,6 +11,17 @@ yarn-error.log*
 # Env
 .env
 .env.*
+.envrc
+.npmrc
+.pypirc
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+*.keystore
 
 # Editors/OS
 .DS_Store
