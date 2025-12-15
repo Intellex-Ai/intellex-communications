@@ -16,12 +16,22 @@ const templatesDir = path.resolve(__dirname, '..', 'templates');
 const emailFrom = process.env.EMAIL_FROM;
 const resendKey = process.env.EMAIL_PROVIDER_KEY;
 const webhookSecret = process.env.EMAIL_WEBHOOK_SECRET;
+const apiSecret = process.env.COMMUNICATIONS_API_SECRET;
 const resend = resendKey ? new Resend(resendKey) : null;
 
 function normalizeTemplatePath(template: string): string {
+  // Block path traversal attempts
+  if (template.includes('..')) {
+    throw new Error('Invalid template path');
+  }
   const cleaned = template.replace(/^\/+/, '');
   const withExt = cleaned.endsWith('.html') ? cleaned : `${cleaned}.html`;
-  return path.join(templatesDir, withExt);
+  const resolved = path.resolve(templatesDir, withExt);
+  // Ensure resolved path stays within templates directory
+  if (!resolved.startsWith(templatesDir + path.sep) && resolved !== templatesDir) {
+    throw new Error('Template path outside allowed directory');
+  }
+  return resolved;
 }
 
 function renderTemplate(raw: string, data: Record<string, unknown>): string {
@@ -43,6 +53,17 @@ app.get('/health', (_req: Request, res: Response) => {
 });
 
 app.post('/send', async (req: Request, res: Response) => {
+  // Auth check - fail closed if secret not configured
+  if (!apiSecret) {
+    res.status(503).json({ error: 'COMMUNICATIONS_API_SECRET not configured' });
+    return;
+  }
+  const providedSecret = req.headers['x-communications-secret'];
+  if (providedSecret !== apiSecret) {
+    res.status(401).json({ error: 'Invalid or missing secret' });
+    return;
+  }
+
   const body = req.body as SendRequest;
   if (!body?.id || !body?.channel || !body?.template || !body?.to) {
     res.status(400).json({ error: 'id, channel, template, and to are required' });
