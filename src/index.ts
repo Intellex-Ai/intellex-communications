@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
 import express, { type Request, type Response } from 'express';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { readdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -40,9 +40,12 @@ const sendLimiter = rateLimit({
   keyGenerator: (req) => {
     const header = req.headers['x-communications-secret'];
     if (Array.isArray(header)) {
-      return header.join(',');
+      return `secret:${header[0] || ''}`;
     }
-    return header || req.ip || 'anon';
+    if (header) {
+      return `secret:${header}`;
+    }
+    return ipKeyGenerator(req.ip || '');
   },
 });
 
@@ -227,6 +230,6 @@ app.post('/webhooks/provider', (req: Request, res: Response) => {
   res.status(204).end();
 });
 
-app.listen(port, () => {
+app.listen(port, '0.0.0.0', () => {
   console.log(`intellex-communications listening on :${port}`);
 });
