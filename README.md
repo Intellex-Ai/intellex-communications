@@ -20,6 +20,7 @@ Email and notification templates, provider adapters, and schedulers for user-fac
 ## Environment
 - Copy `.env.example` to `.env` and set:
   - `EMAIL_PROVIDER_KEY`, `EMAIL_FROM`, `EMAIL_WEBHOOK_SECRET`
+  - `COMMUNICATIONS_API_SECRET` (required for `/send`)
   - `API_BASE_URL` (for routing replies/errors to the API)
   - `COMMUNICATIONS_BASE_URL` (self base URL for webhooks)
   - `REDIS_URL` if using async queueing
@@ -37,7 +38,7 @@ Email and notification templates, provider adapters, and schedulers for user-fac
 
 ## Runtime
 - Express + TypeScript service (entry `src/index.ts`) exposing:
-  - `POST /send` — accepts `SendRequest` from `src/contracts/send.ts` and sends via Resend.
+  - `POST /send` — accepts `SendRequest` from `src/contracts/send.ts` and sends via Resend (shared secret + rate limiting enforced).
   - `POST /webhooks/provider` — placeholder for provider events (verifies `EMAIL_WEBHOOK_SECRET`).
   - `GET /health` — liveness check.
 - Templates are loaded from `templates/` and rendered by simple `{{ .Key }}` replacement.
