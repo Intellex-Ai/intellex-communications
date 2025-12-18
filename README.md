@@ -21,6 +21,7 @@ Email and notification templates, provider adapters, and schedulers for user-fac
 - Copy `.env.example` to `.env` and set:
   - `EMAIL_PROVIDER_KEY`, `EMAIL_FROM`, `EMAIL_WEBHOOK_SECRET`
   - `COMMUNICATIONS_API_SECRET` (required for `/send`)
+  - `PORT` and `BIND_HOST` (optional; defaults `8700` and `0.0.0.0`)
   - `API_BASE_URL` (for routing replies/errors to the API)
   - `COMMUNICATIONS_BASE_URL` (self base URL for webhooks)
   - `REDIS_URL` if using async queueing

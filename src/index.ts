@@ -13,14 +13,16 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-const port = Number(process.env.PORT || 8700);
+const DEFAULT_PORT = 8700;
+const port = parsePort(process.env.PORT, DEFAULT_PORT);
+const bindHost = process.env.BIND_HOST || process.env.HOST || '0.0.0.0';
 const templatesDir = path.resolve(__dirname, '..', 'templates');
 const emailFrom = process.env.EMAIL_FROM;
 const resendKey = process.env.EMAIL_PROVIDER_KEY;
 const webhookSecret = process.env.EMAIL_WEBHOOK_SECRET;
 const apiSecret = process.env.COMMUNICATIONS_API_SECRET;
 const resend = resendKey ? new Resend(resendKey) : null;
-const allowedTemplates = discoverTemplates(templatesDir);
+const allowedTemplates = safeDiscoverTemplates(templatesDir);
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_SUBJECT_LENGTH = 180;
@@ -49,6 +51,15 @@ const sendLimiter = rateLimit({
   },
 });
 
+function parsePort(portRaw: string | undefined, fallbackPort: number): number {
+  if (!portRaw) return fallbackPort;
+  const parsed = Number.parseInt(portRaw, 10);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    return fallbackPort;
+  }
+  return parsed;
+}
+
 function discoverTemplates(baseDir: string): Set<string> {
   const templates = new Set<string>();
   const walk = (dir: string) => {
@@ -69,6 +80,16 @@ function discoverTemplates(baseDir: string): Set<string> {
 
   walk(baseDir);
   return templates;
+}
+
+function safeDiscoverTemplates(baseDir: string): Set<string> {
+  try {
+    return discoverTemplates(baseDir);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Failed to discover templates under ${baseDir}: ${message}`);
+    return new Set<string>();
+  }
 }
 
 function normalizeTemplateName(template: string): string {
@@ -168,6 +189,11 @@ app.post('/send', sendLimiter, async (req: Request, res: Response) => {
     return;
   }
 
+  if (allowedTemplates.size === 0) {
+    res.status(503).json({ error: 'No templates available' });
+    return;
+  }
+
   const body = req.body as Partial<SendRequest>;
   let validated: { id: string; templateName: string; to: string; subject: string; data: Record<string, unknown> };
   try {
@@ -230,6 +256,12 @@ app.post('/webhooks/provider', (req: Request, res: Response) => {
   res.status(204).end();
 });
 
-app.listen(port, '0.0.0.0', () => {
-  console.log(`intellex-communications listening on :${port}`);
+const server = app.listen(port, bindHost, () => {
+  console.log(`intellex-communications listening on ${bindHost}:${port}`);
+});
+
+server.on('error', (error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`intellex-communications failed to start: ${message}`);
+  process.exit(1);
 });
