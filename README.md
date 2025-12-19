@@ -19,10 +19,10 @@ Email and notification templates, provider adapters, and schedulers for user-fac
 
 ## Environment
 - Copy `.env.example` to `.env` and set:
-  - `EMAIL_PROVIDER_KEY`, `EMAIL_FROM`, `EMAIL_WEBHOOK_SECRET`
-  - `COMMUNICATIONS_API_SECRET` (required for `/send`)
+  - `EMAIL_PROVIDER_KEY`, `EMAIL_FROM`, `EMAIL_WEBHOOK_SECRET` (Resend webhook signing secret)
+  - `COMMUNICATIONS_API_SECRET` (required for `/send` and API event forwarding)
   - `PORT` and `BIND_HOST` (optional; defaults `8700` and `0.0.0.0`)
-  - `API_BASE_URL` (for routing replies/errors to the API)
+  - `API_BASE_URL` (for routing delivery events to the API)
   - `COMMUNICATIONS_BASE_URL` (self base URL for webhooks)
   - `REDIS_URL` if using async queueing
   - `LOG_LEVEL`
@@ -40,7 +40,7 @@ Email and notification templates, provider adapters, and schedulers for user-fac
 ## Runtime
 - Express + TypeScript service (entry `src/index.ts`) exposing:
   - `POST /send` — accepts `SendRequest` from `src/contracts/send.ts` and sends via Resend (shared secret + rate limiting enforced).
-  - `POST /webhooks/provider` — placeholder for provider events (verifies `EMAIL_WEBHOOK_SECRET`).
+- `POST /webhooks/provider` — provider events (verifies Resend `resend-signature` using `EMAIL_WEBHOOK_SECRET`).
   - `GET /health` — liveness check.
 - Templates are loaded from `templates/` and rendered by simple `{{ .Key }}` replacement.
 
@@ -51,4 +51,4 @@ Email and notification templates, provider adapters, and schedulers for user-fac
 
 ## Notes
 - `EMAIL_PROVIDER_KEY` must be a Resend API key and `EMAIL_FROM` must be a verified sender/domain.
-- Webhook routing back to `intellex-api` is a follow‑up once delivery tracking is needed.
+- Webhook and send events are forwarded to `intellex-api` (`/communications/messages` and `/communications/events`) when `API_BASE_URL` is set.

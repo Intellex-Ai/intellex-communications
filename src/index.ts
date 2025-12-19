@@ -6,12 +6,24 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Resend } from 'resend';
 
-import type { SendRequest, SendResponse, ProviderEvent } from './contracts/send';
+import type { SendRequest, SendResponse } from './contracts/send';
+import { RESEND_SIGNATURE_HEADER, verifyResendSignature } from './webhooks/resend';
 
 dotenv.config();
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+
+type RawBodyRequest = Request & { rawBody?: string };
+
+const JSON_BODY_LIMIT = '1mb';
+app.use(
+  express.json({
+    limit: JSON_BODY_LIMIT,
+    verify: (req, _res, buf) => {
+      (req as RawBodyRequest).rawBody = buf.toString('utf8');
+    },
+  }),
+);
 
 const DEFAULT_PORT = 8700;
 const port = parsePort(process.env.PORT, DEFAULT_PORT);
@@ -21,8 +33,15 @@ const emailFrom = process.env.EMAIL_FROM;
 const resendKey = process.env.EMAIL_PROVIDER_KEY;
 const webhookSecret = process.env.EMAIL_WEBHOOK_SECRET;
 const apiSecret = process.env.COMMUNICATIONS_API_SECRET;
+const apiBaseUrl = process.env.API_BASE_URL;
 const resend = resendKey ? new Resend(resendKey) : null;
 const allowedTemplates = safeDiscoverTemplates(templatesDir);
+
+const API_EVENTS_PATH = '/communications/events';
+const API_MESSAGES_PATH = '/communications/messages';
+const API_REQUEST_TIMEOUT_MS = 5000;
+const PROVIDER_NAME = 'resend';
+const CHANNEL_EMAIL = 'email';
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_SUBJECT_LENGTH = 180;
@@ -30,6 +49,43 @@ const MAX_ID_LENGTH = 120;
 const MAX_DATA_BYTES = 20000;
 const SEND_RATE_LIMIT = 30;
 const SEND_WINDOW_MS = 60_000;
+const WEBHOOK_TOLERANCE_SECONDS = 300;
+const EPOCH_MS_THRESHOLD = 1_000_000_000_000;
+
+const COMMUNICATION_STATUSES = {
+  queued: 'queued',
+  sent: 'sent',
+  failed: 'failed',
+  delivered: 'delivered',
+  bounced: 'bounced',
+  complaint: 'complaint',
+  dropped: 'dropped',
+} as const;
+
+type CommunicationStatus = (typeof COMMUNICATION_STATUSES)[keyof typeof COMMUNICATION_STATUSES];
+
+type ApiMessagePayload = {
+  requestId: string;
+  provider: string;
+  providerMessageId?: string;
+  channel: string;
+  template?: string;
+  recipient?: string;
+  subject?: string;
+  metadata?: Record<string, unknown>;
+  status: CommunicationStatus;
+  error?: string;
+  timestamp: number;
+};
+
+type ApiEventPayload = {
+  provider: string;
+  messageId?: string;
+  requestId?: string;
+  status: CommunicationStatus;
+  timestamp: number;
+  payload?: Record<string, unknown>;
+};
 
 const sendLimiter = rateLimit({
   windowMs: SEND_WINDOW_MS,
@@ -58,6 +114,151 @@ function parsePort(portRaw: string | undefined, fallbackPort: number): number {
     return fallbackPort;
   }
   return parsed;
+}
+
+function joinUrl(base: string, pathSuffix: string): string {
+  const trimmedBase = base.replace(/\/+$/, '');
+  const trimmedPath = pathSuffix.startsWith('/') ? pathSuffix : `/${pathSuffix}`;
+  return `${trimmedBase}${trimmedPath}`;
+}
+
+async function postApiPayload(pathSuffix: string, payload: ApiMessagePayload | ApiEventPayload) {
+  if (!apiBaseUrl) {
+    console.warn('API_BASE_URL not set; skipping communications event forwarding');
+    return;
+  }
+  if (!apiSecret) {
+    console.warn('COMMUNICATIONS_API_SECRET not set; skipping communications event forwarding');
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS);
+  try {
+    const url = joinUrl(apiBaseUrl, pathSuffix);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-communications-secret': apiSecret,
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      console.warn(`Communications event forward failed (${response.status})`);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`Communications event forward error: ${message}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function readString(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+const EVENT_STATUS_ALIASES: Record<string, CommunicationStatus> = {
+  delivered: COMMUNICATION_STATUSES.delivered,
+  bounced: COMMUNICATION_STATUSES.bounced,
+  complaint: COMMUNICATION_STATUSES.complaint,
+  complained: COMMUNICATION_STATUSES.complaint,
+  dropped: COMMUNICATION_STATUSES.dropped,
+  sent: COMMUNICATION_STATUSES.sent,
+  failed: COMMUNICATION_STATUSES.failed,
+  queued: COMMUNICATION_STATUSES.queued,
+};
+
+function normalizeStatus(raw: string): CommunicationStatus | null {
+  const lowered = raw.toLowerCase().trim().replace(/^email\./, '');
+  return EVENT_STATUS_ALIASES[lowered] ?? null;
+}
+
+const MESSAGE_ID_PATHS = [
+  ['data', 'email_id'],
+  ['data', 'id'],
+  ['data', 'message_id'],
+  ['data', 'messageId'],
+  ['email_id'],
+  ['message_id'],
+  ['messageId'],
+  ['id'],
+];
+
+const TIMESTAMP_PATHS = [
+  ['data', 'created_at'],
+  ['data', 'timestamp'],
+  ['created_at'],
+  ['timestamp'],
+  ['event_timestamp'],
+];
+
+function getNestedValue(payload: Record<string, unknown>, pathParts: string[]): unknown {
+  let current: unknown = payload;
+  for (const part of pathParts) {
+    if (!current || typeof current !== 'object') {
+      return null;
+    }
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current;
+}
+
+function extractMessageId(payload: Record<string, unknown>): string | null {
+  for (const pathParts of MESSAGE_ID_PATHS) {
+    const value = getNestedValue(payload, pathParts);
+    const asString = readString(value);
+    if (asString) return asString;
+  }
+  return null;
+}
+
+function extractStatus(payload: Record<string, unknown>): CommunicationStatus | null {
+  const candidates = [payload.type, payload.event, payload.status];
+  for (const candidate of candidates) {
+    const asString = readString(candidate);
+    if (!asString) continue;
+    const normalized = normalizeStatus(asString);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function extractTimestampMs(payload: Record<string, unknown>): number {
+  for (const pathParts of TIMESTAMP_PATHS) {
+    const value = getNestedValue(payload, pathParts);
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value > EPOCH_MS_THRESHOLD ? value : value * 1000;
+    }
+    const asString = readString(value);
+    if (asString) {
+      const parsed = Date.parse(asString);
+      if (!Number.isNaN(parsed)) {
+        return parsed;
+      }
+      const numeric = Number(asString);
+      if (Number.isFinite(numeric)) {
+        return numeric > EPOCH_MS_THRESHOLD ? numeric : numeric * 1000;
+      }
+    }
+  }
+  return Date.now();
+}
+
+function buildWebhookEvent(payload: Record<string, unknown>): ApiEventPayload | null {
+  const status = extractStatus(payload);
+  if (!status) return null;
+  return {
+    provider: PROVIDER_NAME,
+    messageId: extractMessageId(payload) ?? undefined,
+    status,
+    timestamp: extractTimestampMs(payload),
+    payload,
+  };
 }
 
 function discoverTemplates(baseDir: string): Set<string> {
@@ -145,9 +346,10 @@ function validateSendRequest(body: Partial<SendRequest>) {
     throw new Error('id too long');
   }
 
-  if (body.channel !== 'email') {
+  if (body.channel !== CHANNEL_EMAIL) {
     throw new Error(`Unsupported channel: ${body?.channel ?? 'unknown'}`);
   }
+  const channel = body.channel;
 
   const templateName = normalizeTemplateName(body.template as string);
   if (!allowedTemplates.has(templateName)) {
@@ -173,7 +375,7 @@ function validateSendRequest(body: Partial<SendRequest>) {
     throw new Error('data payload too large');
   }
 
-  return { id, templateName, to, subject, data };
+  return { id, templateName, to, subject, data, channel };
 }
 
 app.post('/send', sendLimiter, async (req: Request, res: Response) => {
@@ -195,7 +397,14 @@ app.post('/send', sendLimiter, async (req: Request, res: Response) => {
   }
 
   const body = req.body as Partial<SendRequest>;
-  let validated: { id: string; templateName: string; to: string; subject: string; data: Record<string, unknown> };
+  let validated: {
+    id: string;
+    templateName: string;
+    to: string;
+    subject: string;
+    data: Record<string, unknown>;
+    channel: string;
+  };
   try {
     validated = validateSendRequest(body);
   } catch (validationError) {
@@ -207,7 +416,7 @@ app.post('/send', sendLimiter, async (req: Request, res: Response) => {
   if (!resend || !emailFrom) {
     const response: SendResponse = {
       id: validated.id,
-      provider: 'resend',
+      provider: PROVIDER_NAME,
       status: 'failed',
       error: 'EMAIL_PROVIDER_KEY and EMAIL_FROM must be configured',
     };
@@ -224,35 +433,79 @@ app.post('/send', sendLimiter, async (req: Request, res: Response) => {
       subject,
       html,
     });
+    const messageId = (result as any)?.data?.id;
 
     const response: SendResponse = {
       id: validated.id,
-      provider: 'resend',
-      status: 'sent',
-      messageId: (result as any)?.data?.id,
+      provider: PROVIDER_NAME,
+      status: COMMUNICATION_STATUSES.sent,
+      messageId,
     };
+    await postApiPayload(API_MESSAGES_PATH, {
+      requestId: validated.id,
+      provider: PROVIDER_NAME,
+      providerMessageId: messageId,
+      channel: validated.channel,
+      template: validated.templateName,
+      recipient: validated.to,
+      subject,
+      metadata: body.metadata ?? undefined,
+      status: COMMUNICATION_STATUSES.sent,
+      timestamp: Date.now(),
+    });
     res.json(response);
   } catch (error) {
     const response: SendResponse = {
       id: validated.id,
-      provider: 'resend',
-      status: 'failed',
+      provider: PROVIDER_NAME,
+      status: COMMUNICATION_STATUSES.failed,
       error: error instanceof Error ? error.message : 'Unknown error',
     };
+    await postApiPayload(API_MESSAGES_PATH, {
+      requestId: validated.id,
+      provider: PROVIDER_NAME,
+      channel: validated.channel,
+      template: validated.templateName,
+      recipient: validated.to,
+      subject: validated.subject,
+      metadata: body.metadata ?? undefined,
+      status: COMMUNICATION_STATUSES.failed,
+      error: response.error,
+      timestamp: Date.now(),
+    });
     res.status(500).json(response);
   }
 });
 
 app.post('/webhooks/provider', (req: Request, res: Response) => {
-  if (webhookSecret) {
-    const provided = req.headers['x-email-webhook-secret'];
-    if (provided !== webhookSecret) {
-      res.status(401).send('invalid webhook secret');
-      return;
-    }
+  if (!webhookSecret) {
+    res.status(503).send('EMAIL_WEBHOOK_SECRET not configured');
+    return;
   }
 
-  const event = req.body as ProviderEvent;
+  const rawBody = (req as RawBodyRequest).rawBody;
+  if (!rawBody) {
+    res.status(400).send('Missing raw request body');
+    return;
+  }
+
+  const verification = verifyResendSignature({
+    secret: webhookSecret,
+    signatureHeader: req.headers[RESEND_SIGNATURE_HEADER],
+    payload: rawBody,
+    toleranceSeconds: WEBHOOK_TOLERANCE_SECONDS,
+  });
+  if (!verification.ok) {
+    res.status(401).send(verification.reason || 'Invalid signature');
+    return;
+  }
+
+  const payload = req.body as Record<string, unknown>;
+  const normalized = buildWebhookEvent(payload);
+  if (normalized) {
+    void postApiPayload(API_EVENTS_PATH, normalized);
+  }
+
   res.status(204).end();
 });
 
